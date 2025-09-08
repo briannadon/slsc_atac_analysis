@@ -15,11 +15,24 @@ ALIGN="$PROJECT/align"
 PEAKS="$PROJECT/peaks"
 QC="$PROJECT/qc"
 
-# Default samples 
+# Default samples and autodiscovery from processed folder if not provided
 SAMPLES=(SRX26680000)
-# If SAMPLES is provided as a space-separated env var, convert to array
 if [[ -n "${SAMPLES:-}" && "$SAMPLES" != *"("*")"* ]]; then
   read -r -a SAMPLES <<< "$SAMPLES"
+fi
+
+# If user didn't override samples, attempt autodiscovery of SRR/SRX bases
+if [[ "${SAMPLES[*]}" == "SRX26680000" ]]; then
+  mapfile -t FOUND <<< "$(
+    {
+      for f in "$SUB"/*_1.fastq.subsampled; do [[ -f "$f" ]] && basename "$f" | sed 's/_1\.fastq\.subsampled$//' || true; done
+      for f in "$SUB"/*_R1.sub.fastq.gz; do [[ -f "$f" ]] && basename "$f" | sed 's/_R1\.sub\.fastq\.gz$//' || true; done
+    } | sort -u
+  )"
+  if [[ ${#FOUND[@]} -gt 0 ]]; then
+    SAMPLES=("${FOUND[@]}")
+    echo "Auto-detected samples: ${SAMPLES[*]}"
+  fi
 fi
 
 mkdir -p "$WORK" "$ALIGN" "$PEAKS" "$QC"
@@ -36,6 +49,45 @@ else echo "ERROR: need macs3 or macs2 installed"; exit 1; fi
 
 # Map sample → genome 
 genome_for() { echo "hg38"; }
+
+# -------------------------- preflight refs -----------------------------------
+# If refs are missing, but data/processed/hg38.fa.gz exists, prepare refs here
+prepare_refs_if_needed() {
+  local ref_fa="$REFDIR/hg38.fa"
+  local ref_fa_gz_src="$SUB/hg38.fa.gz"
+
+  if [[ -f "${ref_fa}.bwt" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$REFDIR"
+
+  if [[ ! -f "$ref_fa" ]]; then
+    if [[ -f "$ref_fa_gz_src" ]]; then
+      echo "Preparing refs from $ref_fa_gz_src"
+      ln -sf "$ref_fa_gz_src" "$REFDIR/hg38.fa.gz"
+      gzip -cd "$REFDIR/hg38.fa.gz" > "$ref_fa"
+    elif [[ -f "$REFDIR/hg38.fa.gz" ]]; then
+      echo "Decompressing existing $REFDIR/hg38.fa.gz"
+      gzip -cd "$REFDIR/hg38.fa.gz" > "$ref_fa"
+    else
+      echo "ERROR: Missing refs. Provide $SUB/hg38.fa.gz or run 02_build_refs.sh"; exit 1
+    fi
+  fi
+
+  if [[ ! -f "${ref_fa}.bwt" ]]; then
+    echo "Building BWA index for hg38..."
+    bwa index "$ref_fa"
+  fi
+
+  if [[ ! -f "$REFDIR/hg38.fa.fai" ]]; then
+    echo "Indexing FASTA and creating chrom.sizes..."
+    faidx "$ref_fa"
+    cut -f1,2 "$REFDIR/hg38.fa.fai" > "$REFDIR/hg38.chrom.sizes"
+  fi
+
+  # Blacklist optional; if present, it will be used for filtering
+}
 
 # ------------------------------- helpers --------------------------------------
 call_and_filter() {
@@ -74,8 +126,13 @@ call_and_filter() {
 # === [1/4] fastp (trim/QC) ===
 echo "=== [1/4] fastp (trim/QC) ==="
 for ACC in "${SAMPLES[@]}"; do
-  IN1="$SUB/${ACC}_R1.sub.fastq.gz"
-  IN2="$SUB/${ACC}_R2.sub.fastq.gz"
+  # Prefer new subsampled naming; fallback to older R1/R2 .sub.fastq.gz
+  IN1="$SUB/${ACC}_1.fastq.subsampled"
+  IN2="$SUB/${ACC}_2.fastq.subsampled"
+  if [[ ! -f "$IN1" || ! -f "$IN2" ]]; then
+    IN1="$SUB/${ACC}_R1.sub.fastq.gz"
+    IN2="$SUB/${ACC}_R2.sub.fastq.gz"
+  fi
   OUT1="$WORK/${ACC}_R1.trim.fastq.gz"
   OUT2="$WORK/${ACC}_R2.trim.fastq.gz"
   HTML="$QC/${ACC}.fastp.html"
@@ -93,9 +150,11 @@ done
 
 # === [2/4] bwa mem → fixmate chain ===
 echo "=== [2/4] bwa mem → fixmate chain ==="
+# Ensure references exist (auto-prepare from data/processed if needed)
+prepare_refs_if_needed
 for ACC in "${SAMPLES[@]}"; do
   REFBASE="$(genome_for "$ACC")"
-  REFPREFIX="$REFDIR/${REFBASE}"  # IMPORTANT: prefix (no .fa)
+  REFPREFIX="$REFDIR/${REFBASE}.fa"  # match bwa index prefix from 02_build_refs.sh
   [[ -f "${REFPREFIX}.bwt" ]] || { echo "Missing BWA index for $REFBASE at ${REFPREFIX}.*"; exit 1; }
 
   TRIM1="$WORK/${ACC}_R1.trim.fastq.gz"
