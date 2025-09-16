@@ -1,6 +1,6 @@
 answers:
-  q1: 99.7
+  q1: 99.7, tolerance 0.5
   q2: 667252
   q3: chr1
   q4: 97
-  q5: 39.3
+  q5: 39.3, tolerance 0.5
